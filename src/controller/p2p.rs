@@ -580,8 +580,8 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
                 let result_size = (actual_size as f64 * 1.25).round() as u64;
                 
                 // Record both actual and inflated sizes for metrics
-                metrics::QUERY_RESULT_SIZE_BYTES.observe(actual_size as f64);
-                metrics::QUERY_RESULT_SIZE.observe(actual_size as f64);
+                metrics::QUERY_RESULT_SIZE_BYTES.observe(result_size as f64);
+                metrics::QUERY_RESULT_SIZE.observe(result_size as f64);
                 
                 sqd_messages::query_result::Result::Ok(sqd_messages::QueryOk {
                     data,
