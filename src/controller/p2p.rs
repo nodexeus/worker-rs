@@ -41,7 +41,10 @@ const CONCURRENT_QUERY_MESSAGES: usize = 32;
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(1);
 const LOGS_KEEP_DURATION: Duration = Duration::from_secs(3600 * 2);
 const LOGS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-const STATUS_UPDATE_INTERVAL: Duration = Duration::from_secs(60);
+// Update status every 10 seconds as per whitepaper specifications
+const STATUS_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
+// Maximum time without a ping before marking as offline
+const PING_TIMEOUT: Duration = Duration::from_secs(15);
 // TODO: find out why the margin is required
 const MAX_LOGS_SIZE: usize =
     sqd_network_transport::protocol::MAX_LOGS_RESPONSE_SIZE as usize - 100 * 1024;
@@ -283,15 +286,74 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
         cancellation_token: CancellationToken,
         interval: Duration,
     ) {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
         let mut timer = tokio::time::interval(interval);
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        
+        // Track last successful ping time using Arc and Mutex for thread safety
+        let last_ping = Arc::new(Mutex::new(std::time::Instant::now()));
+        
         IntervalStream::new(timer)
             .take_until(cancellation_token.cancelled_owned())
-            .for_each(|_| async move {
-                let status = get_worker_status(&self.worker);
-                *self.worker_status.write() = status;
+            .for_each({
+                let last_ping = Arc::clone(&last_ping);
+                let worker = self.worker.clone();
+                let worker_status = self.worker_status.clone();
+                
+                move |_| {
+                    let last_ping = Arc::clone(&last_ping);
+                    let worker = worker.clone();
+                    let worker_status = worker_status.clone();
+                    
+                    async move {
+                        let now = std::time::Instant::now();
+                        let time_since_last_ping = {
+                            let last = last_ping.lock().await;
+                            now.duration_since(*last)
+                        };
+                        
+                        // Check if we've missed too many pings
+                        if time_since_last_ping > PING_TIMEOUT {
+                            metrics::set_status(metrics::WorkerStatus::Offline);
+                            warn!(
+                                "Missed pings for {} seconds, marking as offline",
+                                time_since_last_ping.as_secs()
+                            );
+                        } else {
+                            // Update status with current metrics
+                            let status = get_worker_status(&worker);
+                            *worker_status.write() = status.clone();
+                            
+                            // Record successful ping
+                            *last_ping.lock().await = now;
+                            metrics::record_ping();
+                            
+                            trace!(
+                                "Sent status update and ping at {:?}",
+                                std::time::SystemTime::now()
+                            );
+                            
+                            // Log status periodically (every 10th ping to reduce log spam)
+                            static mut PING_COUNT: u32 = 0;
+                            unsafe {
+                                PING_COUNT = (PING_COUNT + 1) % 10;
+                                if PING_COUNT == 0 {
+                                    info!(
+                                        "Worker status: {:?}, available chunks: {}, downloading: {}",
+                                        status.assignment_id,
+                                        status.missing_chunks.as_ref().map_or(0, |b| b.len() - b.count_zeros() as usize),
+                                        status.stored_bytes
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             })
             .await;
+            
         info!("Status update task finished");
     }
 
