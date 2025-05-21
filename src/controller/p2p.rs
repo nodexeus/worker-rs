@@ -9,7 +9,7 @@ struct QueryInfo {
 }
 
 use anyhow::{anyhow, Result};
-use tracing::{error, info, warn, trace};
+use tracing::{error, info, warn, trace, debug};
 use camino::Utf8PathBuf as PathBuf;
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
