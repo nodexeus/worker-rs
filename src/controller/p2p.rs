@@ -370,14 +370,17 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
                             static PING_COUNT: AtomicU32 = AtomicU32::new(0);
                             let count = PING_COUNT.fetch_add(1, Ordering::Relaxed);
                             if count % 10 == 0 {
-                                let available_chunks = status.missing_chunks.as_ref()
-                                    .map(|b| b.data.len().saturating_sub(b.ones() as usize))
-                                    .unwrap_or(0);
+                                let total_chunks = status.missing_chunks.as_ref().map(|b| b.data.len()).unwrap_or(0) as u64;
+                                let missing_chunks = status.missing_chunks.as_ref().map(|b| b.ones() as u64).unwrap_or(0);
+                                let available_chunks = total_chunks.saturating_sub(missing_chunks);
+                                
                                 info!(
-                                    "Worker status: {:?}, available chunks: {}, stored bytes: {:?}",
-                                    status.assignment_id,
+                                    "Worker status - Assignment: {}, Chunks: {}/{} ({}% available), Stored: {} bytes",
+                                    status.assignment_id.as_deref().unwrap_or("none"),
                                     available_chunks,
-                                    status.stored_bytes
+                                    total_chunks,
+                                    if total_chunks > 0 { available_chunks * 100 / total_chunks } else { 0 },
+                                    status.stored_bytes.unwrap_or(0)
                                 );
                             }
                         }
