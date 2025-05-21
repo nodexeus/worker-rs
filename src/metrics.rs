@@ -1,10 +1,9 @@
 use std::fmt::Write;
 
 use prometheus_client::encoding::{EncodeLabelSet, LabelValueEncoder};
-use prometheus_client::metrics::counter::Counter;
-use prometheus_client::metrics::{family::Family, gauge::Gauge, histogram::Histogram, info::Info};
+use prometheus_client::metrics::{counter::Counter, family::Family, gauge::Gauge, histogram::Histogram, info::Info};
+use prometheus_client::metrics::histogram::exponential_buckets;
 use prometheus_client::registry::{Registry, Unit};
-use std::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use tracing::warn;
 
@@ -35,36 +34,42 @@ struct StatusLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct QueryExecutedLabels {
-    status: QueryStatus,
+pub struct QueryExecutedLabels {
+    pub status: QueryStatus,
 }
 
 lazy_static! {
+    // Status metrics
     static ref STATUS: Family<StatusLabels, Gauge> = Default::default();
+    
+    // Chunk metrics
     pub static ref CHUNKS_AVAILABLE: Gauge = Default::default();
     pub static ref CHUNKS_DOWNLOADING: Gauge = Default::default();
     pub static ref CHUNKS_PENDING: Gauge = Default::default();
     pub static ref CHUNKS_DOWNLOADED: Counter = Default::default();
     pub static ref CHUNKS_FAILED_DOWNLOAD: Counter = Default::default();
     pub static ref CHUNKS_REMOVED: Counter = Default::default();
+    pub static ref CHUNKS_TOTAL: Gauge = Default::default();
+    
+    // Storage metrics
     pub static ref STORED_BYTES: Gauge = Default::default();
-
-    static ref QUERY_EXECUTED: Family<QueryExecutedLabels, Counter> = Default::default();
-    static ref QUERY_RESULT_SIZE: Histogram = Histogram::new(std::iter::empty());
-    static ref READ_CHUNKS: Histogram = Histogram::new(std::iter::empty());
+    
+    // Query metrics
+    pub static ref QUERY_EXECUTED: Family<QueryExecutedLabels, Counter> = Default::default();
+    pub static ref QUERY_RESULT_SIZE: Histogram = Histogram::new(exponential_buckets(1.0, 2.0, 20));
+    pub static ref QUERY_RESULT_SIZE_BYTES: Histogram = Histogram::new(exponential_buckets(1024.0, 2.0, 20)); // 1KB to ~1GB
+    pub static ref READ_CHUNKS: Histogram = Histogram::new(exponential_buckets(1.0, 2.0, 20));
     pub static ref RUNNING_QUERIES: Gauge = Default::default();
     
-    // Liveness metrics
-    static ref PING_COUNT: Counter<u64, u64> = Default::default();
-    static ref LAST_PING_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
-    static ref MISSED_PINGS: Counter<u64, u64> = Default::default();
-    static ref PING_INTERVAL: Histogram = {
-        let buckets = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0]
-            .iter()
-            .map(|s| s * 1000.0) // Convert to milliseconds
-            .collect::<Vec<_>>();
-        Histogram::new(buckets.into_iter())
-    };
+    // Ping metrics
+    pub static ref PING_COUNT: Counter = Default::default();
+    pub static ref PING_INTERVAL: Histogram = Histogram::new(exponential_buckets(1.0, 1.5, 20));
+    pub static ref MISSED_PINGS: Counter = Default::default();
+    
+    // Performance metrics
+    pub static ref QUERY_PROCESSING_TIME: Histogram = Histogram::new(exponential_buckets(0.001, 2.0, 20)); // 1ms to ~1000s
+    pub static ref QUERY_QUEUE_DEPTH: Gauge = Default::default();
+    pub static ref QUERY_QUEUE_WAIT_TIME: Histogram = Histogram::new(exponential_buckets(0.001, 2.0, 20)); // 1ms to ~1000s
 }
 
 pub fn set_status(status: WorkerStatus) {
@@ -76,6 +81,9 @@ pub fn set_status(status: WorkerStatus) {
         .set(1);
 }
 
+// Track the last ping timestamp
+static LAST_PING_TIMESTAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Record a successful ping and update metrics
 pub fn record_ping() {
     let now = std::time::SystemTime::now()
@@ -83,7 +91,7 @@ pub fn record_ping() {
         .unwrap_or_default()
         .as_secs();
     
-    let last_ping = LAST_PING_TIMESTAMP.swap(now, Ordering::Relaxed);
+    let last_ping = LAST_PING_TIMESTAMP.swap(now, std::sync::atomic::Ordering::Relaxed);
     
     if last_ping > 0 {
         let interval = now.saturating_sub(last_ping);
@@ -185,26 +193,55 @@ pub fn register_metrics(registry: &mut Registry, info: Info<Vec<(String, String)
         RUNNING_QUERIES.clone(),
     );
     
-    // Liveness metrics
-    registry.register(
-        "pings_total",
-        "Total number of pings sent by the worker",
-        PING_COUNT.clone(),
-    );
+    // Register metrics with the registry
+    registry.register("pings_total", "Number of pings sent by the worker", PING_COUNT.clone());
+    
     registry.register_with_unit(
-        "ping_interval_ms",
-        "Time between consecutive pings in milliseconds",
-        Unit::new("milliseconds"),
+        "ping_interval_seconds", 
+        "Time between pings in seconds",
+        Unit::Seconds,
         PING_INTERVAL.clone(),
     );
-    registry.register(
-        "missed_pings_total",
-        "Total number of missed pings",
-        MISSED_PINGS.clone(),
+    
+    registry.register("missed_pings_total", "Total number of missed pings", MISSED_PINGS.clone());
+    
+    // Performance metrics
+    registry.register_with_unit(
+        "query_processing_time_seconds",
+        "Time spent processing queries in seconds",
+        Unit::Seconds,
+        QUERY_PROCESSING_TIME.clone(),
     );
+    
+    registry.register(
+        "query_queue_depth",
+        "Current number of queries waiting in the queue",
+        QUERY_QUEUE_DEPTH.clone(),
+    );
+    
+    registry.register_with_unit(
+        "query_queue_wait_time_seconds",
+        "Time queries spend waiting in the queue in seconds",
+        Unit::Seconds,
+        QUERY_QUEUE_WAIT_TIME.clone(),
+    );
+    
+    registry.register(
+        "query_result_size_bytes",
+        "Size of query results in bytes",
+        QUERY_RESULT_SIZE_BYTES.clone(),
+    );
+    
+    // Chunk metrics
+    registry.register("chunks_available", "Number of available chunks", CHUNKS_AVAILABLE.clone());
+    registry.register("chunks_downloading", "Number of chunks being downloaded", CHUNKS_DOWNLOADING.clone());
+    registry.register("chunks_total", "Total number of chunks", CHUNKS_TOTAL.clone());
     
     // Worker status
     registry.register("worker_status", "Status of the worker", STATUS.clone());
+    
+    // Running queries
+    registry.register("running_queries", "Number of currently running queries", RUNNING_QUERIES.clone());
     
     // Initialize with starting status
     set_status(WorkerStatus::Starting);

@@ -1,7 +1,15 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::{Duration, Instant}};
+
+#[derive(Debug)]
+struct QueryInfo {
+    peer_id: PeerId,
+    query: Query,
+    resp_chan: ResponseChannel<sqd_messages::QueryResult>,
+    enqueue_time: Instant,
+}
 
 use anyhow::{anyhow, Result};
-use tracing::{info, warn, trace};
+use tracing::{error, info, warn, trace};
 use camino::Utf8PathBuf as PathBuf;
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
@@ -16,7 +24,6 @@ use sqd_network_transport::{
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tokio_stream::wrappers::{IntervalStream, ReceiverStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
 
 use crate::{
     cli::Args,
@@ -63,9 +70,8 @@ pub struct P2PController<EventStream> {
     keypair: Keypair,
     private_key: Vec<u8>,
     assignment_url: String,
-    queries_tx: mpsc::Sender<(PeerId, Query, ResponseChannel<sqd_messages::QueryResult>)>,
-    queries_rx:
-        UseOnce<mpsc::Receiver<(PeerId, Query, ResponseChannel<sqd_messages::QueryResult>)>>,
+    queries_tx: mpsc::Sender<QueryInfo>,
+    queries_rx: UseOnce<mpsc::Receiver<QueryInfo>>,
     log_requests_tx: mpsc::Sender<(LogsRequest, ResponseChannel<QueryLogs>)>,
     log_requests_rx: UseOnce<mpsc::Receiver<(LogsRequest, ResponseChannel<QueryLogs>)>>,
 }
@@ -185,14 +191,35 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
         );
     }
 
-    async fn run_queries_loop(&self, cancellation_token: CancellationToken) {
+    pub async fn run_queries_loop(&self, cancellation_token: CancellationToken) {
         let queries_rx = self.queries_rx.take().unwrap();
+        
         ReceiverStream::new(queries_rx)
             .take_until(cancellation_token.cancelled_owned())
             .for_each_concurrent(
                 CONCURRENT_QUERY_MESSAGES,
-                |(peer_id, query, resp_chan)| async move {
-                    self.handle_query(peer_id, query, resp_chan).await;
+                |query_info: QueryInfo| {
+                    let this = self;
+                    async move {
+                        // Record queue wait time
+                        let wait_time = query_info.enqueue_time.elapsed();
+                        metrics::QUERY_QUEUE_WAIT_TIME.observe(wait_time.as_secs_f64());
+                        
+                        // Update queue depth
+                        metrics::QUERY_QUEUE_DEPTH.dec();
+                        
+                        // Process the query
+                        let start_time = Instant::now();
+                        this.handle_query(
+                            query_info.peer_id, 
+                            query_info.query, 
+                            query_info.resp_chan
+                        ).await;
+                        
+                        // Record processing time
+                        let proc_time = start_time.elapsed();
+                        metrics::QUERY_PROCESSING_TIME.observe(proc_time.as_secs_f64());
+                    }
                 },
             )
             .await;
@@ -301,12 +328,11 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
             .for_each({
                 let last_ping = Arc::clone(&last_ping);
                 let worker = self.worker.clone();
-                let worker_status = self.worker_status.clone();
                 
                 move |_| {
                     let last_ping = Arc::clone(&last_ping);
                     let worker = worker.clone();
-                    let worker_status = worker_status.clone();
+                    let _status = self.worker_status.read().clone();
                     
                     async move {
                         let now = std::time::Instant::now();
@@ -326,7 +352,7 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
                             // Update status with current metrics
                             let status = get_worker_status(&worker);
                             {
-                                let mut status_guard = worker_status.write();
+                                let mut status_guard = self.worker_status.write();
                                 *status_guard = status.clone();
                             }
                             
@@ -345,7 +371,7 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
                             let count = PING_COUNT.fetch_add(1, Ordering::Relaxed);
                             if count % 10 == 0 {
                                 let available_chunks = status.missing_chunks.as_ref()
-                                    .map(|b| b.0.len() * 8 - b.0.count_zeros() as usize)
+                                    .map(|b| b.data.len().saturating_sub(b.ones() as usize))
                                     .unwrap_or(0);
                                 info!(
                                     "Worker status: {:?}, available chunks: {}, stored bytes: {:?}",
@@ -406,13 +432,23 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
                     if !self.validate_query(&query, peer_id) {
                         continue;
                     }
-                    match self.queries_tx.try_send((peer_id, query, resp_chan)) {
-                        Ok(_) => {}
+                    
+                    let query_info = QueryInfo {
+                        peer_id,
+                        query,
+                        resp_chan,
+                        enqueue_time: Instant::now(),
+                    };
+                    
+                    match self.queries_tx.try_send(query_info) {
+                        Ok(_) => {
+                            metrics::QUERY_QUEUE_DEPTH.inc();
+                        }
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             warn!("Queries queue is full. Dropping query from {peer_id}");
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            break;
+                            warn!("Queries channel closed. Dropping query from {peer_id}");
                         }
                     }
                 }
@@ -539,19 +575,30 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
         let query_result = match result {
             Ok(result) => {
                 let data = result.compressed_data();
+                let result_size = data.len() as u64;
+                
+                // Record the result size
+                metrics::QUERY_RESULT_SIZE_BYTES.observe(result_size as f64);
+                
                 sqd_messages::query_result::Result::Ok(sqd_messages::QueryOk {
                     data,
                     last_block: result.last_block,
                 })
             }
-            Err(e) => query_error::Err::from(e).into(),
+            Err(e) => {
+                // Still record failed queries with 0 size
+                metrics::QUERY_RESULT_SIZE_BYTES.observe(0.0);
+                query_error::Err::from(e).into()
+            }
         };
+        
         let mut msg = sqd_messages::QueryResult {
             query_id,
             result: Some(query_result),
             retry_after_ms: retry_after.map(|duration| duration.as_millis() as u32),
             signature: Default::default(),
         };
+        
         msg.sign(&self.keypair).map_err(|e| anyhow!(e))?;
 
         let result_size = msg.encoded_len() as u64;
