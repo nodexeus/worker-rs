@@ -1,4 +1,4 @@
-use std::{fmt::Write, time::Duration};
+use std::fmt::Write;
 
 use prometheus_client::encoding::{EncodeLabelSet, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
@@ -6,6 +6,7 @@ use prometheus_client::metrics::{family::Family, gauge::Gauge, histogram::Histog
 use prometheus_client::registry::{Registry, Unit};
 use std::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
+use tracing::warn;
 
 use crate::query::result::{QueryError, QueryResult};
 
@@ -54,15 +55,16 @@ lazy_static! {
     pub static ref RUNNING_QUERIES: Gauge = Default::default();
     
     // Liveness metrics
-    static ref PING_COUNT: Counter = Default::default();
+    static ref PING_COUNT: Counter<u64, u64> = Default::default();
     static ref LAST_PING_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
-    static ref PING_INTERVAL: Histogram = Histogram::new(
-        [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0]
-            .into_iter()
+    static ref MISSED_PINGS: Counter<u64, u64> = Default::default();
+    static ref PING_INTERVAL: Histogram = {
+        let buckets = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0]
+            .iter()
             .map(|s| s * 1000.0) // Convert to milliseconds
-            .collect()
-    );
-    static ref MISSED_PINGS: Counter = Default::default();
+            .collect::<Vec<_>>();
+        Histogram::new(buckets.into_iter())
+    };
 }
 
 pub fn set_status(status: WorkerStatus) {
@@ -192,7 +194,7 @@ pub fn register_metrics(registry: &mut Registry, info: Info<Vec<(String, String)
     registry.register_with_unit(
         "ping_interval_ms",
         "Time between consecutive pings in milliseconds",
-        Unit::Milliseconds,
+        Unit::new("milliseconds"),
         PING_INTERVAL.clone(),
     );
     registry.register(

@@ -1,6 +1,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
+use tracing::{info, warn, trace};
 use camino::Utf8PathBuf as PathBuf;
 use futures::{Stream, StreamExt};
 use parking_lot::RwLock;
@@ -324,7 +325,10 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
                         } else {
                             // Update status with current metrics
                             let status = get_worker_status(&worker);
-                            *worker_status.write() = status.clone();
+                            {
+                                let mut status_guard = worker_status.write();
+                                *status_guard = status.clone();
+                            }
                             
                             // Record successful ping
                             *last_ping.lock().await = now;
@@ -336,17 +340,19 @@ impl<EventStream: Stream<Item = WorkerEvent> + Send + 'static> P2PController<Eve
                             );
                             
                             // Log status periodically (every 10th ping to reduce log spam)
-                            static mut PING_COUNT: u32 = 0;
-                            unsafe {
-                                PING_COUNT = (PING_COUNT + 1) % 10;
-                                if PING_COUNT == 0 {
-                                    info!(
-                                        "Worker status: {:?}, available chunks: {}, downloading: {}",
-                                        status.assignment_id,
-                                        status.missing_chunks.as_ref().map_or(0, |b| b.len() - b.count_zeros() as usize),
-                                        status.stored_bytes
-                                    );
-                                }
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static PING_COUNT: AtomicU32 = AtomicU32::new(0);
+                            let count = PING_COUNT.fetch_add(1, Ordering::Relaxed);
+                            if count % 10 == 0 {
+                                let available_chunks = status.missing_chunks.as_ref()
+                                    .map(|b| b.0.len() * 8 - b.0.count_zeros() as usize)
+                                    .unwrap_or(0);
+                                info!(
+                                    "Worker status: {:?}, available chunks: {}, stored bytes: {:?}",
+                                    status.assignment_id,
+                                    available_chunks,
+                                    status.stored_bytes
+                                );
                             }
                         }
                     }
